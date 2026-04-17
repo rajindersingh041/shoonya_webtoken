@@ -1,4 +1,6 @@
 import json
+import orjson
+import struct
 import requests
 import threading
 import websocket
@@ -10,9 +12,9 @@ import time
 import urllib
 from time import sleep
 from datetime import datetime as dt
+import websocket._app as _ws_app
 
 logger = logging.getLogger(__name__)
-
 
 class position:
     prd: str
@@ -25,10 +27,8 @@ class position:
     buyqty: int
     sellqty: int
     netqty: int
-
     def encode(self):
         return self.__dict__
-
 
 class ProductType:
     Delivery = "C"
@@ -36,11 +36,9 @@ class ProductType:
     Normal = "M"
     CF = "M"
 
-
 class FeedType:
     TOUCHLINE = 1
     SNAPQUOTE = 2
-
 
 class PriceType:
     Market = "MKT"
@@ -48,21 +46,17 @@ class PriceType:
     StopLossLimit = "SL-LMT"
     StopLossMarket = "SL-MKT"
 
-
 class BuyorSell:
     Buy = "B"
     Sell = "S"
-
 
 def reportmsg(msg):
     # print(msg)
     logger.debug(msg)
 
-
 def reporterror(msg):
     # print(msg)
     logger.error(msg)
-
 
 def reportinfo(msg):
     # print(msg)
@@ -127,18 +121,34 @@ class NorenApi:
         self.__exchange_messages = []
         self.__OAuthHeaders = None
 
-    def __ws_run_forever(self):
+        self.ws_auth_failed = False
+        self.__resubscribe = False
 
-        while self.__stop_event.is_set() == False:
-            try:
-                self.__websocket.run_forever(ping_interval=3, ping_payload='{"t":"h"}')
-            except Exception as e:
-                logger.warning(f"websocket run forever ended in exception, {e}")
+        self.__tl_set = set()
+        self.__sq_set = set()
 
-            sleep(0.1)  # Sleep for 100ms between reconnection.
+        for attr in (
+            "__subscribe_callback",
+            "__order_update_callback",
+            "__on_error",
+            "__on_open",
+            "__broadcast_callback",
+        ):
+            setattr(self, attr, self.__dummy_callback)
+
+    # def __ws_run_forever(self):
+    #
+    #    while self.__stop_event.is_set() == False:
+    #        try:
+    #            self.__websocket.run_forever( ping_interval=3,  ping_payload='{"t":"h"}')
+    #        except Exception as e:
+    #            logger.warning(f"websocket run forever ended in exception, {e}")
+    #
+    #        sleep(0.1) # Sleep for 100ms between reconnection.
 
     def __ws_send(self, *args, **kwargs):
-        while self.__websocket_connected == False:
+        # while self.__websocket_connected == False:
+        while not self.__websocket_connected:
             sleep(
                 0.05
             )  # sleep for 50ms if websocket is not connected, wait for reconnection
@@ -159,6 +169,9 @@ class NorenApi:
         self.__username = uid
         self.__accountid = accountid
 
+    def __dummy_callback(self, msg=None):
+        pass
+
     def __on_open_callback(self, ws=None, web: bool = False, access_token: str = None):
         self.__websocket_connected = True
 
@@ -171,7 +184,11 @@ class NorenApi:
         values["uid"] = self.__username
         values["actid"] = self.__username
 
-        values["susertoken"] = access_token
+        if web:
+            values["susertoken"] = access_token
+        else:
+            values["accesstoken"] = access_token
+            # values["usertoken"]    = access_token
 
         if web:
             values["source"] = "WEB"
@@ -201,30 +218,49 @@ class NorenApi:
         # print(data_type)
         # print(continue_flag)
 
-        res = json.loads(message)
+        res = orjson.loads(message)
 
-        if self.__subscribe_callback is not None:
-            if res["t"] == "tk" or res["t"] == "tf":
+        """
+        if(self.__subscribe_callback is not None):
+            if res['t'] == 'tk' or res['t'] == 'tf':
                 self.__subscribe_callback(res)
                 return
-            if res["t"] == "dk" or res["t"] == "df":
+            if res['t'] == 'dk' or res['t'] == 'df':
                 self.__subscribe_callback(res)
                 return
 
-        if self.__on_error is not None:
-            if res["t"] == "ck" and res["s"] != "OK":
+        if(self.__on_error is not None):
+            if res['t'] == 'ak' and res['s'] != 'OK':
                 self.__on_error(res)
                 return
 
-        if self.__order_update_callback is not None:
-            if res["t"] == "om":
+        if(self.__order_update_callback is not None):
+            if res['t'] == 'om':
                 self.__order_update_callback(res)
                 return
 
         if self.__on_open:
-            if res["t"] == "ck" and res["s"] == "OK":
+            if res['t'] == 'ak' and res['s'] == 'OK':
                 self.__on_open()
                 return
+        """
+        t = res["t"]
+        if t in {"df", "tf", "dk", "tk"}:
+            self.__subscribe_callback(res)
+        elif t == "om":
+            self.__order_update_callback(res)
+        elif t in {"ak", "ck"}:
+            if res["s"] != "OK":
+                self.__on_error(res)
+            else:
+                if self.__resubscribe:
+                    if self.__tl_set:
+                        self.subscribe(list(self.__tl_set), FeedType.TOUCHLINE)
+                    if self.__sq_set:
+                        self.subscribe(list(self.__sq_set), FeedType.SNAPQUOTE)
+                self.__on_open()
+        elif t in {"am", "ms"}:
+            self.__broadcast_callback(res)
 
     def start_websocket(
         self,
@@ -234,6 +270,7 @@ class NorenApi:
         socket_close_callback=None,
         socket_error_callback=None,
         access_token=None,
+        resubscribe=True,
     ):
         """Start a websocket connection for getting live data"""
         self.__on_open = socket_open_callback
@@ -249,10 +286,40 @@ class NorenApi:
         else:
             access_token = self.__access_token
 
-        reportmsg(access_token)
+        self.__resubscribe = resubscribe
+
+        # reportmsg(access_token)
 
         url = f"{self.__service_config['websocket_endpoint']}/{access_token}"
         reportmsg("connecting to {}".format(url))
+
+        api_self = self
+
+        websocket_run_forever = _ws_app.WebSocketApp.run_forever
+
+        def __run_forever(ws_app, *args, **kwargs):
+            reconnect = kwargs.get("reconnect", 0)
+            _recv_frame = websocket.WebSocket.recv_frame
+
+            def __recv_frame(ws_inner):
+                frame = _recv_frame(ws_inner)
+                if (
+                    reconnect
+                    and frame.opcode == websocket.ABNF.OPCODE_CLOSE
+                    and len(frame.data) >= 2
+                    and struct.unpack("!H", frame.data[:2])[0] == 1008
+                ):
+                    ws_app.keep_running = False
+                    api_self.ws_auth_failed = True
+                return frame
+
+            websocket.WebSocket.recv_frame = __recv_frame
+            try:
+                return websocket_run_forever(ws_app, *args, **kwargs)
+            finally:
+                websocket.WebSocket.recv_frame = _recv_frame
+
+        _ws_app.WebSocketApp.run_forever = __run_forever
 
         self.__websocket = websocket.WebSocketApp(
             url,
@@ -263,13 +330,6 @@ class NorenApi:
                 ws=ws, web=web, access_token=access_token
             ),
         )
-        # th = threading.Thread(target=self.__send_heartbeat)
-        # th.daemon = True
-        # th.start()
-        # if run_in_background is True:
-        # self.__ws_thread = threading.Thread(target=self.__ws_run_forever)
-        # self.__ws_thread.daemon = True
-        # self.__ws_thread.start()
 
         threading.Thread(
             target=self.__websocket.run_forever,
@@ -280,12 +340,12 @@ class NorenApi:
         ).start()
 
     def close_websocket(self):
-        if self.__websocket_connected == False:
+        if not self.__websocket_connected:
             return
         self.__stop_event.set()
         self.__websocket_connected = False
         self.__websocket.close()
-        self.__ws_thread.join()
+        # self.__ws_thread.join()
 
     ###### OAuth Update ######
     def getOAuthURL(self, oauth_url, api_key=None):
@@ -335,7 +395,9 @@ class NorenApi:
             reportmsg(f"Error occured: {resDict}")
             return None
 
-    def loginWEB(self, userid, password, twoFA, vendor_code, api_secret, imei):
+    def loginWEB(
+        self, userid, password, twoFA, vendor_code, api_secret, imei, webkey=None
+    ):
         config = NorenApi.__service_config
 
         url2 = "https://trade.shoonya.com/NorenWClientWeb/QuickAuth"
@@ -354,9 +416,7 @@ class NorenApi:
         values["pwd"] = pwd
         values["factor2"] = twoFA
         values["vc"] = "NOREN_WEB"
-        values["appkey"] = (
-            "6a0ef29ec3f2fa560d8bd5b2c8c9a17c439d21d60f021a67032c9c5739481e79"
-        )
+        values["appkey"] = webkey
         values["imei"] = imei
         values["apkversion"] = "20230714"
         values["addldivinf"] = "Chrome-121.0.0.0"
@@ -379,9 +439,55 @@ class NorenApi:
         resD = json.loads(res2.text)
 
         if resD["stat"] != "Ok":
+            print(res2)
+            print(resD)
             return None
 
         return resD
+
+    ###### OAuth Update ######
+
+    def login(
+        self, userid, password, twoFA, vendor_code, api_secret, imei, access_type=None
+    ):
+        config = NorenApi.__service_config
+
+        # prepare the uri
+        url = f"{config['host']}{config['routes']['authorize']}"
+        reportmsg(url)
+
+        # Convert to SHA 256 for password and app key
+        pwd = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        u_appkey = "{0}|{1}".format(userid, api_secret)
+        appkey = hashlib.sha256(u_appkey.encode("utf-8")).hexdigest()
+
+        # prepare the data
+
+        if access_type == None:
+            values = {"source": "API", "apkversion": "1.0.0"}
+        else:
+            values = {"source": access_type, "apkversion": "1.0.0"}
+
+        values["uid"] = userid
+        values["pwd"] = pwd
+        values["factor2"] = twoFA
+        values["vc"] = vendor_code
+        values["appkey"] = appkey
+        values["imei"] = imei
+
+        payload = "jData=" + json.dumps(values)
+        reportmsg("Req:" + payload)
+
+        res = requests.post(url, data=payload)
+        reportmsg("Reply:" + res.text)
+
+        resDict = json.loads(res.text)
+        if resDict["stat"] != "Ok":
+            return None
+
+        # reportmsg(self.__susertoken)
+
+        return resDict["susertoken"]
 
     def set_session(self, userid, accesstoken):
 
@@ -453,43 +559,96 @@ class NorenApi:
 
         return resDict
 
+    """
     def subscribe(self, instrument, feed_type=FeedType.TOUCHLINE):
         values = {}
 
-        if feed_type == FeedType.TOUCHLINE:
-            values["t"] = "t"
-        elif feed_type == FeedType.SNAPQUOTE:
-            values["t"] = "d"
+        if(feed_type == FeedType.TOUCHLINE):
+            values['t'] =  't'
+        elif(feed_type == FeedType.SNAPQUOTE):
+            values['t'] =  'd'
         else:
-            values["t"] = str(feed_type)
+            values['t'] =  str(feed_type)
 
         if type(instrument) == list:
-            values["k"] = "#".join(instrument)
-        else:
-            values["k"] = instrument
+            values['k'] = '#'.join(instrument)
+        else :
+            values['k'] = instrument
 
         data = json.dumps(values)
 
-        # print(data)
+        #print(data)
         self.__ws_send(data)
+    """
 
+    def subscribe(
+        self, instrument, feed_type=FeedType.TOUCHLINE, batch_size=30, delay=0.1
+    ):
+        t = threading.Thread(
+            target=self.__subscribe_worker,
+            args=(instrument, feed_type, batch_size, delay),
+            daemon=True,
+        )
+        t.start()
+
+    def __subscribe_worker(self, instrument, feed_type, batch_size, delay):
+        ft = {"t": "t", FeedType.TOUCHLINE: "t", "d": "d", FeedType.SNAPQUOTE: "d"}.get(
+            feed_type
+        )
+
+        if not ft:
+            return
+
+        tokens = instrument if isinstance(instrument, list) else [instrument]
+
+        if self.__resubscribe:
+            (self.__tl_set if ft == "t" else self.__sq_set).update(tokens)
+
+        [
+            self.__ws_send(
+                json.dumps({"t": ft, "k": "#".join(tokens[i : i + batch_size])})
+            )
+            or time.sleep(delay)
+            for i in range(0, len(tokens), batch_size)
+        ]
+
+    """
     def unsubscribe(self, instrument, feed_type=FeedType.TOUCHLINE):
         values = {}
 
-        if feed_type == FeedType.TOUCHLINE:
-            values["t"] = "u"
-        elif feed_type == FeedType.SNAPQUOTE:
-            values["t"] = "ud"
+        if(feed_type == FeedType.TOUCHLINE):
+            values['t'] =  'u'
+        elif(feed_type == FeedType.SNAPQUOTE):
+            values['t'] =  'ud'
 
         if type(instrument) == list:
-            values["k"] = "#".join(instrument)
-        else:
-            values["k"] = instrument
+            values['k'] = '#'.join(instrument)
+        else :
+            values['k'] = instrument
 
         data = json.dumps(values)
 
-        # print(data)
+        #print(data)
         self.__ws_send(data)
+    """
+
+    def unsubscribe(self, instrument, feed_type=FeedType.TOUCHLINE):
+        ft = {
+            "t": "u",
+            FeedType.TOUCHLINE: "u",
+            "d": "ud",
+            FeedType.SNAPQUOTE: "ud",
+        }.get(feed_type)
+
+        if not ft:
+            return
+
+        tokens = instrument if isinstance(instrument, list) else [instrument]
+
+        if self.__resubscribe:
+            (self.__tl_set if ft == "u" else self.__sq_set).difference_update(tokens)
+
+        self.__ws_send(json.dumps({"t": ft, "k": "#".join(tokens)}))
 
     def subscribe_orders(self):
         values = {"t": "o"}
@@ -902,7 +1061,7 @@ class NorenApi:
         reportmsg(url)
 
         # prepare the data
-        values = {"ordersource": "API"}
+        values = {}  # {'ordersource':'API'}
         values["uid"] = self.__username
         values["actid"] = self.__accountid
 

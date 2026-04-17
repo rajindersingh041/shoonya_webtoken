@@ -1,10 +1,18 @@
 user_configs = {
-    "C210": {
+    "FAxxxxxx": {
         "user_id": "",
         "pwd": "",
         "api_key": "",
         "totp": "",
         "secret": "",
+        "webkey": "",
     },
-    "XXXXX3": {"user_id": "", "pwd": "", "api_key": "", "totp": "", "secret": ""},
+    "XXXXX3": {
+        "user_id": "",
+        "pwd": "",
+        "api_key": "",
+        "totp": "",
+        "secret": "",
+        "webkey": "",
+    },
 }
